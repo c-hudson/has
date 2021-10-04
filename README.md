@@ -1,5 +1,4 @@
-# has
-# Higher Availability Service
+# has - Higher Availability Service
     This service is to allow user connections to survive restarts of your MUSH, restarts of the server hosting the MUSH, and fail overs to another machine. 
     
 # High level, How does it work?
@@ -15,6 +14,6 @@ Lower level, How does this work?
    
 # Login Details:
    The script currently looks for the user to type a 'connect <user> <password>' command. Once detected, the HAS service queries the MUSH via a password(user,password) function to determine if the user typed in a valid user and password. If it did, it stores the user / password pair in memory for use when reconnecting. This function will need to be changed to support other MUSH server types.
-  
+
 # Fail Over:
     This will be supported in the next version of the HAS server. The idea will be that if the MUSH server goes down, the code will fail over to a different server after a set amount of time. Currently, the server only supports manual fail over in which the mush address is changed within the script and then the running process is sent a HUP signal.
