@@ -28,17 +28,33 @@
 #    be used in the future. Wait for version 2.0 as more important         #
 #    stability issues are being addressed at this time.                    #
 #                                                                          #
+#    This service requries the use of a heartbeat user. The user is        #
+#    used to issue a command to the MUSH whenever a connection is          #
+#    disconnected. If the command returns the expected result, the         #
+#    server assumes the MUSH is running fine and the user issued a         #
+#    QUIT command. If the command doesn't return as spected, the MUSH      #
+#    probably crashed and the connection is kept open till the server      #
+#    is back up. This user should be set KEEPALIVE or whatever it          #
+#    takes for the MUSH to not boot the player. If the player is           #
+#    disconnected, its possible that plays may not be able to dis-         #
+#    connect properly during the window in which the heartbeat             #
+#    player is reconnecting. Players should never disconnect anyways,      # 
+#    so this is a plus?                                                    #
+#                                                                          #
 ############################################################################
 
 use strict;
 use IO::Select;
 use IO::Socket;
 use Digest::MD5;
+use IO::Socket::SSL;
+use IO::Socket::Timeout;
 
 my (%conn,                                                 # connection data
     %world,                        # reverse lookup from world to connection
     $listener,                                                # the listener
     $readable,                                            # sockets to watch
+    $ssl_listen,                                          # listener for ssl
     $hb,                                     # heartbeat connection to world
     %data,                          # misc data not specific to a connection
    );
@@ -63,12 +79,17 @@ sub init_data
    @data{connect_success} = "Last connect was from.*";
 
    # address of the actual mush
+   # this can be changed if the mush moves, just send a SIGHUP signal
+   # to the process.
+#   @data{mush_address} = "192.168.1.8:4201";
    @data{mush_address} = "192.168.1.7:4096";
 
-   # port that this service will listen on
-   @data{local_port} = 4000;
+   # port that this service will listen on. Set to zero to disable
+   # ports can not be currently changed while the server is running.
+   @data{local_port} = 4201;
+   @data{local_port_ssl} = 4202;
 
-   # how often to try to reconnect
+   # how often to try to reconnect in seconds
    @data{beat} = 10;
 
    # credentials for the hearbeat user
@@ -79,6 +100,10 @@ sub init_data
    # Setting this variable to an empty string will cause it not to send
    # the command.
    @data{remotehostname_cmd} = "\@REMOTEHOSTNAME";
+
+   # initial connect time in epoch unix time with remotehostname_cmd
+   # in the following format: @remotehostname <hostname> = <epoch_time>
+   @data{add_epoch_time} = 1;
 
    # message shown when the world goes offline
    @data{offline_notice} = <<'   __EOF__';
@@ -98,7 +123,7 @@ sub init_data
    @data{online_notice} =~ s/([\r\n]+)$//;
 
    if(@data{prev_mush_address} ne @data{mush_address}) {
-      printf("Remote Address: %s\n",@data{mush_address});
+      loggit("Remote Address:     %s\n",@data{mush_address});
    }
 }
 
@@ -153,8 +178,10 @@ sub handle_disconnect
    my $id = shift;
 
    if($hb == $id) {                                   # heartbeat disconnect
+#      printf("handle_disconnect: hb disconnected\n");
       disconnect_hb();
    } elsif(defined @conn{$id}) {                        # client disconnect
+#      printf("handle_disconnect: client disconnected\n");
       disconnect_client($id);
    } elsif(defined @world{$id}) {
       my $s = id($id);
@@ -164,6 +191,7 @@ sub handle_disconnect
          @conn{$s}->{disconnect} = time();
    
          if($hb eq undef) {                  # hb is offline, world is down
+#            printf("handle_disconnect: world_offline\n");
             disconnect_world($s);
             @conn{$s}->{reconnect} = 1;
          } else {
@@ -173,6 +201,7 @@ sub handle_disconnect
             # is no responce, then the server is down and the user should
             # be reconnected when the world is back online.
             #
+#            printf("handle_disconnect: pinging hb\n");
             @conn{$s}->{reconnect} = 1;
             printf($hb "think ### PING: " . $s . "###\n");
          }
@@ -211,16 +240,22 @@ sub world_connect
    # assume failure
    @conn{$s} = {} if(!defined @conn{$s});
    @conn{$s}->{client} = $s,
-   @conn{$s}->{created} = time() if(!defined @conn{created});
+   @conn{$s}->{created} = time() if(!defined @conn{$s}->{created});
 
    return 0 if !online();                  # hb is offline, don't reconnect
 
    my $new = socket_open($s); # connect
    return 0 if($new eq undef);                            # did not connect
 
-   # optionally send command to tell the world user's address.
+   # optionally send command to tell the world user's address and original
+   # connect time.
    if(@data{remotehostname_cmd} ne "") {
-      printf($new "@data{remotehostname_cmd} %s\n",$s->peerhost); #
+      if(@data{add_epoch_time}) {
+         printf($new "@data{remotehostname_cmd} %s=%s\n",
+            $s->peerhost,@conn{$s}->{created}); #
+      } else {
+         printf($new "@data{remotehostname_cmd} %s\n", $s->peerhost);
+      }
    }
 
    @conn{$s}->{world} = $new; #                               hook up socket
@@ -239,6 +274,25 @@ sub world_connect
    }
    return 1;
 }
+#
+# server_hostname
+#    lookup the hostname based upon the ip address
+#
+sub server_hostname
+{
+   my $sock = shift;
+   my $ip = $sock->peerhost;                           # contains ip address
+
+   my $name = gethostbyaddr(inet_aton($ip),AF_INET);
+
+   if($name =~ /^\s*$/ || $name =~ /in-addr\.arpa$/) {
+      return $ip;                            # last resort, return ip address
+   } else {
+      return $name;                                         # return hostname
+   }
+}
+
+
 
 #
 # handle_select
@@ -257,6 +311,26 @@ sub handle_select
             $readable->add($new);
             world_connect($new);
          }
+      } elsif($s == $ssl_listen) {
+         if(($new = $ssl_listen->accept)) {
+            # nothing
+         } else {
+            loggit("#2> ssl: $!,$SSL_ERROR");
+         }
+         IO::Socket::SSL->start_SSL(
+             $new,
+             SSL_server    => 1,
+             SSL_cert_file => "cert.pem",
+             SSL_key_file  => "key.pem",
+         ) or do {
+            loggit("# ssl fail\n");
+            my $addr = server_hostname($s);
+            loggit("#1> ssl: $!,$SSL_ERROR");
+            $new->close;
+            return;
+         };
+         $readable->add($new);
+         world_connect($new);
       } elsif(($bytes = sysread($s,$buf,1024)) <= 0) {
          handle_disconnect($s);                        # socket disconnected
       } elsif($bytes ne undef) {     # found input, process a line at a time
@@ -301,10 +375,21 @@ sub io_world
       if($data =~ /### RECONNECT COMPLETE ###/) {   # recon complete, stop gag
          printf($sock "%s\n",@data{online_notice});
          delete @conn{$s}->{reconnect};
+         @conn{$s}->{gag_connect} = time();
       }
    } else {
+      # gag connects for 3 seconds after re-connecting.
       my $sock = @conn{$s}->{client};
-      printf($sock "%s\n", $data);  # send world output to client
+      if(defined @conn{$s}->{gag_connect}) {
+         if(@conn{$s}->{gag_connect} + 3 < time()) {
+            delete @conn{$s}->{gag_connect};
+            printf($sock "%s\n", $data);  # send world output to client
+         } elsif($data !~ /has connected\.$/) {
+            printf($sock "%s\n", $data);  # send world output to client
+         }
+      } else {
+         printf($sock "%s\n", $data);  # send world output to client
+      }
    }
 
    if(que_next($sock) eq "connect") {
@@ -562,7 +647,8 @@ sub io_client
                    }
           );
    }
-   printf($sock "%s\n", $data);
+
+   printf($sock "%s\n", $data) if($sock ne undef);
 }
 
 #
@@ -651,6 +737,7 @@ sub loggit
 {
    my ($fmt,@args) = @_;
 
+   $fmt =~ s/\n$//g if($fmt =~ /\n/);
    printf("%s]  $fmt\n",ts(),@args);
 }
 
@@ -736,10 +823,34 @@ sub server_start
 {
    my $port = shift;
 
-   $listener = IO::Socket::INET->new(LocalPort=>@data{local_port},Listen=>1,
-      Reuse=>1);
+
+   if(@data{local_port_ssl} == 0 && @data{local_port} == 0) {
+      die("Non-ssl and ssl ports disabled, nothing to do.");
+   }
+
    $readable = IO::Select->new();
-   $readable->add($listener);
+
+   if(@data{local_port_ssl} > 0) {
+      $ssl_listen = IO::Socket::SSL->can_ipv6->new(
+          Listen             => 5,
+          LocalPort          => @data{local_port_ssl},
+          Proto              => 'tcp',
+          SSL_startHandshake => 0,
+          SSL_cert_file      => "cert.pem",
+          SSL_key_file       => "key.pem");
+      IO::Socket::Timeout->enable_timeouts_on($ssl_listen);
+      $ssl_listen->read_timeout(.7);
+      $ssl_listen->write_timeout(.7);
+      $readable->add($ssl_listen);
+      loggit("SSL listen on:      %s port",@data{local_port_ssl});
+   }
+
+   if(@data{local_port} > 0) {
+      $listener = IO::Socket::INET->new(LocalPort=>@data{local_port},Listen=>1,
+         Reuse=>1);
+      $readable->add($listener);
+      loggit("Non-SSL listen on:  %s port",@data{local_port});
+   }
 }
 
 sub hb_open_connect
@@ -834,10 +945,12 @@ sub disconnect_hb
        $hb = undef;
 
        for my $id (keys %conn) {
-          disconnect_world($id);
-          @conn{$id}->{reconnect} = 1;
-          my $sock = @conn{$id}->{client};
-          printf($sock "%s\n",@data{offline_notice});
+          if(!@conn{$id} != 1) {
+             disconnect_world($id);
+             @conn{$id}->{reconnect} = 1;
+             my $sock = @conn{$id}->{client};
+             printf($sock "%s\n",@data{offline_notice});
+          }
        }
     }
     hb_open_connect();
